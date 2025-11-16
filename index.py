@@ -4,7 +4,7 @@ import sys
 import logging
 import dotenv
 from pathlib import Path
-from typing import Iterator, Dict, Any
+from typing import Iterator, Dict, Any, Optional
 from elasticsearch import Elasticsearch, helpers
 
 # ---------- Config ----------
@@ -16,13 +16,13 @@ dotenv.load_dotenv()  # load from .env file
 ES_ENDPOINT = os.getenv("ES_ENDPOINT")
 ES_API_KEY = os.getenv("ES_API_KEY")
 
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("index_data")
 
 # ---------- Mappings ----------
 MAPPINGS = {
     "mappings": {
+        "dynamic": "strict",
         "properties": {
             "ticket_class": {"type": "keyword"},
             "ticket_priority": {"type": "integer"},
@@ -56,10 +56,19 @@ MAPPINGS = {
             "resolution_time_hours": {"type": "float"},
             "ticket_age_days": {"type": "integer"},
             "is_automated": {"type": "boolean"},
-            "critical_application_flag": {"type": "boolean"}
+            "critical_application_flag": {"type": "boolean"},
         }
     }
 }
+
+ID_FIELDS = (
+    "incident_ticket_number",
+    "Incident Ticket Number",
+    "incident ticket number",
+    "ticket_number",
+    "Ticket Number",
+    "ticketnumber",
+)
 
 def get_client() -> Elasticsearch:
     es = Elasticsearch(
@@ -78,95 +87,101 @@ def get_client() -> Elasticsearch:
     return es
 
 def ensure_index(es: Elasticsearch, index_name: str) -> None:
-    """
-    Create index with explicit mappings if it doesn't exist.
-    """
+    """Create index with explicit mappings if it doesn't exist."""
     try:
         exists = es.indices.exists(index=index_name)
     except Exception:
         exists = False
-
     if not exists:
         logger.info("Creating index '%s' with explicit mappings...", index_name)
         es.indices.create(index=index_name, body=MAPPINGS)
     else:
         logger.info("Index '%s' already exists; skipping creation.", index_name)
 
+def sniff_delimiter(path: Path) -> str:
+    """Auto-detect CSV delimiter; default to comma."""
+    with path.open("r", encoding="utf-8-sig", newline="") as fh:
+        sample = fh.read(8192)
+        try:
+            return csv.Sniffer().sniff(sample, delimiters=[",", "\t", ";", "|"]).delimiter
+        except Exception:
+            return ","
+
 def read_csv_rows(path: Path) -> Iterator[Dict[str, Any]]:
     """
     Stream rows from CSV as dicts (CSV to JSON conversion).
-    Assumes first line is header.
+    Auto-detects delimiter and handles BOM.
     """
-    with path.open(newline="", encoding="utf-8") as fh:
-        reader = csv.DictReader(fh, delimiter='\t')
+    delimiter = sniff_delimiter(path)
+    with path.open(newline="", encoding="utf-8-sig") as fh:
+        reader = csv.DictReader(fh, delimiter=delimiter)
+        if reader.fieldnames and len(reader.fieldnames) == 1 and "," in (reader.fieldnames[0] or ""):
+            raise ValueError("Bad delimiter detected: header collapsed into one column.")
         for row in reader:
             yield row
 
 def normalize_row(row: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Convert 'Unknown' (any case/whitespace) and empty strings to None.
-    Convert TRUE/FALSE strings to Python booleans.
+    Convert 'Unknown' and empty strings to None.
+    Convert TRUE/FALSE/Y/N to booleans.
     Convert numeric fields to correct types.
     """
-    out = {}
+    out: Dict[str, Any] = {}
     for k, v in row.items():
         if isinstance(v, str):
             v_clean = v.strip()
             v_lower = v_clean.lower()
             if v_lower == "unknown" or v_clean == "":
                 out[k] = None
-            elif v_lower == "true":
+            elif v_lower in {"true", "y", "yes"}:
                 out[k] = True
-            elif v_lower == "false":
+            elif v_lower in {"false", "n", "no"}:
                 out[k] = False
             else:
                 if k in {"ticket_priority", "opened_year", "opened_month", "opened_day", "opened_hour", "ticket_age_days"}:
-                    try:
-                        out[k] = int(v_clean)
-                    except Exception:
-                        out[k] = None
+                    try: out[k] = int(v_clean)
+                    except Exception: out[k] = None
                 elif k in {"resolution_time_hours"}:
-                    try:
-                        out[k] = float(v_clean)
-                    except Exception:
-                        out[k] = None
+                    try: out[k] = float(v_clean)
+                    except Exception: out[k] = None
                 else:
                     out[k] = v_clean
         else:
             out[k] = v
     return out
 
+def pick_doc_id(row: Dict[str, Any]) -> Optional[str]:
+    lower_map = {k.lower(): k for k in row.keys() if k}
+    for key in ID_FIELDS:
+        lk = key.lower()
+        if lk in lower_map:
+            val = row.get(lower_map[lk])
+            if val is not None:
+                sid = str(val).strip()
+                if sid:
+                    return sid
+    return None
+
 def actions_from_rows(rows: Iterator[Dict[str, Any]], index_name: str):
     """
-    Turning CSV rows into bulk index actions.
-    Use 'ticket_number' as _id for records.
+    Turn CSV rows into bulk index actions.
+    Use incident ticket number (or ticket_number variants) as _id.
     """
     for row in rows:
         row = normalize_row(row)
-        doc_id = None
-
-        for key in ("ticket_number", "Ticket Number", "ticketnumber"):
-            if key in row and (row[key] or "").strip():
-                doc_id = str(row[key]).strip()
-                break
+        for alias in list(row.keys()):
+            if alias.lower() in {"incident ticket number", "incident_ticket_number"}:
+                row.setdefault("ticket_number", row[alias])
+        doc_id = pick_doc_id(row)
         if not doc_id:
-            for key in ("hostname", "Hostname"):
-                if key in row and (row[key] or "").strip():
-                    doc_id = str(row[key]).strip()
-                    break
-
-        yield {
-            "_op_type": "index",
-            "_index": index_name,
-            "_id": doc_id,
-            "_source": row
-        }
+            logger.warning("Skipping row without incident ticket number.")
+            continue
+        yield {"_op_type": "index", "_index": index_name, "_id": doc_id, "_source": row}
 
 def main() -> None:
     if not ES_ENDPOINT or not ES_API_KEY:
         logger.error("Missing ES_ENDPOINT or ES_API_KEY environment variables.")
         sys.exit(3)
-
     if not CSV_PATH.exists():
         logger.error("CSV not found: %s", CSV_PATH.resolve())
         sys.exit(1)
@@ -174,10 +189,13 @@ def main() -> None:
     es = get_client()
     ensure_index(es, INDEX_NAME)
 
-    logger.info("Reading rows from %s", CSV_PATH)
-    rows_iter = read_csv_rows(CSV_PATH)
-    actions = actions_from_rows(rows_iter, INDEX_NAME)
+    try:
+        rows_iter = read_csv_rows(CSV_PATH)
+    except Exception as e:
+        logger.exception("CSV format/delimiter issue: %s", e)
+        sys.exit(4)
 
+    actions = actions_from_rows(rows_iter, INDEX_NAME)
     logger.info("Starting bulk indexing into '%s' ...", INDEX_NAME)
     try:
         indexed, _ = helpers.bulk(
