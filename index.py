@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Iterator, Dict, Any, Optional
 from elasticsearch import Elasticsearch, helpers
 
-# ---------- Config ----------
+#  Config 
 CSV_PATH = Path("data/IncidentTableData_cleaned.csv")
 INDEX_NAME = "incident_tabledata"
 
@@ -19,7 +19,7 @@ ES_API_KEY = os.getenv("ES_API_KEY")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("index_data")
 
-# ---------- Mappings ----------
+#  Mappings 
 MAPPINGS = {
     "mappings": {
         "dynamic": "strict",
